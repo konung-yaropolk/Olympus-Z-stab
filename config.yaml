@@ -1,0 +1,299 @@
+# Z-plane stabiliser for Olympus FluoView — settings.
+#
+# Every number the program uses is here; nothing is baked into the exe. Copy
+# this file beside the exe and edit it. The program reads `config.yaml` from its
+# own directory unless told otherwise with `--config <path>`.
+#
+# Two things you must set before arming: the `z_up` / `z_down` click sequences
+# at the bottom, and `arm: true`. Run `olympus-z-stab --where` to read screen
+# coordinates off the acquisition software with the mouse.
+
+# ---------------------------------------------------------------- input
+input:
+  # Which recorded channel to measure focus on. Channels are numbered in the
+  # order the file first mentions them, which is the order the acquisition
+  # software lists them. `sum` adds them, which is usually worse: a dim second
+  # channel adds noise and no structure.
+  channel: 0
+  # Measure on part of the frame only: [x, y, width, height] in pixels, or
+  # `null` for the whole frame. A region over structured tissue and away from
+  # the edges measures focus far better than a whole frame that is half
+  # background — and it is the cheapest speed-up there is.
+  roi: null
+  # 1 = full resolution, 2 = every second pixel, and so on. Focus drift is a
+  # low-frequency effect; 2 is usually indistinguishable from 1 and four times
+  # cheaper. Do not raise this above 2 with the `brenner` metric, which reads
+  # pixel-to-pixel differences.
+  downsample: 1
+  # How often to look at the file for new frames, milliseconds. There is no cost
+  # to polling often — nothing is re-read — so this only sets how quickly the
+  # program notices. Frames arrive at 7.5 Hz in the recordings this was built
+  # against, so 500 ms sees 3-4 new frames each time.
+  poll_interval_ms: 500
+  # Give up and exit if the file stops growing for this long, seconds. This is
+  # how the program notices the acquisition finished. Set it comfortably longer
+  # than any pause the acquisition software takes when it rolls over to a new
+  # part file.
+  idle_timeout_s: 60
+
+# ---------------------------------------------------------- measurement
+measure:
+  # "Starting position": the first `reference_frames` usable frames are averaged
+  # into the reference that every later window is compared against.
+  reference_frames: 30
+  # Frames to throw away before the reference starts. The first frames of a
+  # two-photon recording are not like the rest — the PMT settles and the
+  # brightest pixels bleach fastest — and a reference built from them reads as a
+  # focus loss a few seconds later, when nothing has moved.
+  reference_skip: 10
+  # Length of the moving average compared against the reference. Longer is
+  # steadier and slower: at 7.5 Hz, 30 frames is 4 seconds of averaging. This
+  # is the single most useful knob for trading noise against response time.
+  window_frames: 30
+  # Cancelling the X/Y movement. The sample slides sideways during a recording,
+  # and that must not be corrected — but it does ruin the focus measurement, so
+  # each frame is shifted back onto the reference before being measured.
+  #
+  # The shift is measured by phase correlation and applied as a **whole number
+  # of pixels**, never interpolated: resampling a frame smooths it, and
+  # smoothing is exactly what the focus metric is looking for. A sub-pixel
+  # remainder is left uncorrected, which is harmless.
+  registration:
+    enabled: true
+    # Shifts larger than this are rejected as a failed match rather than
+    # applied. A real X/Y drift is tens of pixels over minutes.
+    max_shift_px: 64
+    # Width, in pixels, of the cosine edge taper applied before the FFT. Without
+    # it the frame's edges act as a step and the correlation peaks at zero shift.
+    taper: 5.0
+    # Correlation peaks weaker than this mean the frames did not match; the
+    # frame is skipped rather than measured against a wrong alignment.
+    min_peak: 0.03
+    # Consecutive failed matches after which the alignment reference is replaced
+    # with the current frame.
+    #
+    # This is not a tuning knob, it is a requirement, and finding that out cost a
+    # full run over a real recording. Aligning every frame against the *first*
+    # frame of the session works beautifully for about four minutes and then
+    # stops: on the reference recording — where a drug application triples the
+    # fluorescence — the correlation peak fell from 200x the surface mean to a
+    # noise floor of 6x by frame 4500, after which the peak position was random,
+    # exceeded `max_shift_px`, and every frame was rejected. Two thirds of a
+    # 12,561-frame recording was skipped and the moving average simply froze.
+    #
+    # The sample at frame 6000 matches frame 5900 perfectly well. It just does
+    # not match frame 1. So when matching fails this many times in a row, the
+    # current frame becomes the new reference.
+    #
+    # Refreshing is safe for the focus measurement: the metric is a ratio of
+    # spatial frequencies within one window, not a pixel-wise comparison against
+    # the reference, so which window it is measured on does not matter as long as
+    # the frames inside one moving average are aligned to each other. The
+    # starting-position focus reference is a separate thing and is never
+    # refreshed.
+    refresh_after: 5
+  # Which focus metric to track:
+  #
+  #   high_freq_ratio  power above `high_cut` over power above `low_cut`.
+  #                    THE DEFAULT, and on real data the only usable one.
+  #   norm_variance    variance / mean^2.
+  #   brenner          sum of squared differences two pixels apart.
+  #   tenengrad        Sobel gradient magnitude.
+  #   top_percentile   mean of the brightest pixels.
+  #
+  # These were measured against a 29-minute two-photon recording in which a drug
+  # application nearly triples the fluorescence — a hard case, and a realistic
+  # one. Per metric: how far it wanders from its starting value over the
+  # recording with nothing defocused, against how far a real 0.5 px defocus
+  # moves it.
+  #
+  #                     drift    defocus   signal/drift
+  #   high_freq_ratio     18%       -32%        1.8
+  #   brenner             169%      -33%        0.2
+  #   tenengrad           154%      -33%        0.2
+  #   top_percentile      169%      -3.7%       0.0
+  #   norm_variance       415%      -9.0%       0.0
+  #
+  # Only `high_freq_ratio` has a signal larger than its own drift, and it is the
+  # only one that should be used with a fixed start-of-recording reference. The
+  # others respond to defocus perfectly well — they are simply swamped by the
+  # sample getting brighter. They are kept because they are cheap and are fine on
+  # a stable preparation, and because `hill_climb` compares across ten seconds
+  # rather than half an hour, where all of them beat their own noise easily.
+  #
+  # Do not change this without running `--replay` on one of your own recordings
+  # and looking at what the `metric_rel` column actually does.
+  metric: high_freq_ratio
+  high_freq:
+    # Spatial frequencies as a fraction of Nyquist.
+    #
+    # Measured, not chosen: across a grid of seven low cuts and five high ones on
+    # the reference recording, these gave the best ratio of defocus response to
+    # honest drift. The obvious first guess, 0.05/0.35, drifted 40% over that
+    # recording — the band above 0.35 Nyquist is mostly shot noise, and shot
+    # noise shrinks as a fraction of the signal when the signal brightens, so
+    # that choice was substantially measuring brightness.
+    #
+    # The optimum is a broad plateau rather than a spike, so small changes here
+    # are harmless. Lower `high_cut` if your recordings are noisier than usual.
+    low_cut: 0.12
+    high_cut: 0.30
+  # Discard a frame when more than this fraction of its pixels are saturated.
+  # The recordings this was built against are 10-bit in 16-bit words, so
+  # saturation is at 1023, not 65535; the program reads the real bit depth out of
+  # the file rather than assuming.
+  #
+  # The guard is for a field clipped flat, which has no high-frequency content
+  # left and would read as catastrophic defocus. It is NOT for a field with a few
+  # bright cell bodies in it, and the difference matters: on the reference
+  # recording a real frame from the brighter half clips 2.9% of its pixels, and
+  # the focus signal is completely unharmed — a 0.5 px defocus still moves the
+  # metric by 31% to 38%, exactly as it does in the dim half. The original 1%
+  # limit rejected two thirds of that recording as unmeasurable while nothing at
+  # all was wrong with it.
+  #
+  # So 0.20 is an order of magnitude above what healthy data shows, and still
+  # well below a field that is actually clipped.
+  saturated_fraction: 0.20
+
+# ------------------------------------------------------------- control
+control:
+  # How the direction of the drift is decided.
+  #
+  #   hill_climb       Watch the metric. When it has dropped past `dead_band`,
+  #                    click one step, look again, and reverse if that made it
+  #                    worse. Needs no calibration and no z-stack, at the cost
+  #                    of one wrong step per event and a brief disturbance.
+  #
+  #   reference_stack  Correlate the current window against a z-stack recorded
+  #                    beforehand, read the signed offset in microns straight
+  #                    off it, and move by that much. Never guesses a direction
+  #                    and never over-shoots, but you must record the stack
+  #                    first and it must be of this field of view.
+  mode: hill_climb
+  # Relative drop in the metric that counts as real defocus.
+  #
+  # A FRACTION, NOT A PERCENTAGE. 0.20 is twenty per cent. If you want a tenth
+  # of a per cent, write 0.001 — writing 0.1 gives you a *ten per cent* band,
+  # which on a recording whose honest drift never exceeds 8.6% means nothing is
+  # ever corrected and the session looks broken when it is doing as it was told.
+  #
+  # The program prints the threshold both ways at startup, against the `rel`
+  # column it then prints on every row:
+  #
+  #   band    0.10% — acts when rel < 0.999
+  #
+  # so check that line rather than this one. Below this drop nothing happens.
+  #
+  # This is large on purpose, and it is the number most worth measuring for your
+  # own rig. It comes from running this program over the whole 29-minute reference
+  # recording: across the 12,492 frames it measured, `metric_rel` spanned 0.914 to
+  # 1.042 with nothing defocused at all — a worst honest drop of 8.6%, because the
+  # sample itself changes. A 3% band, which is what this program started with,
+  # would have fired inside the first minutes and gone on firing all session.
+  #
+  # What 0.20 costs: it catches a defocus of roughly 0.45 px of blur and larger,
+  # and ignores anything smaller. What it buys: better than a 2x margin over the
+  # drift, so it does not chase the sample.
+  #
+  # To set it properly, run `--replay` on a recording of your own where nothing
+  # went wrong, open the log, and take the largest downward excursion the
+  # `metric_rel` column makes. Your dead band goes above that. If that number
+  # comes out so large that real drift would be missed, use `mode:
+  # reference_stack` instead — it compares against actual z planes and is not
+  # troubled by the sample changing brightness.
+  dead_band: 0.20
+  # Consecutive moving-average windows that must agree before acting. With
+  # `window_frames: 30` at 7.5 Hz, 2 windows is 8 seconds of sustained
+  # defocus — long enough that a passing bubble or a bright transient cannot
+  # trigger a correction.
+  confirm_windows: 2
+  # After a correction, ignore the metric for this long, seconds. The stage
+  # takes time to settle and the moving average takes `window_frames` to
+  # refill; acting before both have happened corrects the same drift twice.
+  cooldown_s: 10
+  # Never make more than this many steps in one correction event.
+  max_steps_per_event: 3
+  # Never make more than this many steps in the whole session, in either
+  # direction. This is the backstop against a metric that turns out to fall
+  # steadily for a reason that is not focus: it bounds how far the program can
+  # possibly drive the stage before it stops and says so.
+  max_total_steps: 40
+  hill_climb:
+    # Steps per probe. 1 unless one click moves the stage less than the
+    # measurement noise.
+    probe_steps: 1
+    # Which way to try first: 1 for up (`z_up`), -1 for down. Thermal drift in
+    # a given rig is usually one direction; setting this correctly halves the
+    # number of wrong first guesses.
+    initial_direction: 1
+  reference_stack:
+    # An .oir z-stack recorded over this field of view before the timelapse
+    # started. Required when `mode: reference_stack`.
+    path: null
+    # Microns between the stack's planes. Read it off the acquisition software's
+    # z-stack settings; the stack file's own spacing is used when it states one.
+    step_um: 1.0
+    # Correlation below this means the current frame does not resemble any plane
+    # of the stack — the field of view has changed, or the stack is of somewhere
+    # else. The program holds rather than acting on a bad match.
+    min_score: 0.3
+
+# ------------------------------------------------------------ actuator
+actuator:
+  # Nothing touches the mouse while this is false: the program prints the
+  # correction it would have made and carries on measuring. Leave it false for
+  # the first session on a new rig, read the log, and only then arm it — either
+  # here or with `--arm` on the command line.
+  arm: false
+  # Microns of stage movement per step, if you know it. Left `null`, the program
+  # learns it from the `zPosition` the file records for every frame: it reads z
+  # before and after its first correction and reports what one step was worth.
+  # The value is only used for reporting and for `reference_stack` mode, which
+  # needs it to turn a measured offset in microns into a number of steps.
+  um_per_step: null
+  # Confirm each correction actually happened by checking that the `zPosition`
+  # recorded in the file changed. This is the one true check available: if the
+  # click missed its target, or the acquisition window lost focus, z does not
+  # move and the program says so instead of clicking again and again.
+  verify_with_zposition: true
+  # Stop everything the moment the mouse pointer is put in the upper-left corner
+  # of the screen, as the autoclicker does. Leave this on: it is the fastest way
+  # to take back control of a machine that is clicking on its own.
+  emergency_stop_corner: true
+  # Seconds to wait after a click sequence before trusting the next measurement.
+  # The stage has to arrive, and the acquisition software may take a frame or
+  # two to act on the click at all.
+  settle_s: 1.5
+  # What "one step up" and "one step down" mean, as click/key sequences. These
+  # use the same vocabulary as the autoclicker's workflow files, so a sequence
+  # recorded there can be pasted straight in:
+  #
+  #   {step: click,       x: 100, y: 200, delay: 0.2}
+  #   {step: right_click, x: 100, y: 200, delay: 0.2}
+  #   {step: text_input,  text: "9741.19", delay: 0.2}
+  #   {step: press_key,   key: enter, delay: 0.2}
+  #   {step: hotkey,      keys: [ctrl, shift, u], delay: 0.2}
+  #
+  # The coordinates below are placeholders and WILL click the wrong thing.
+  # Replace them: run `olympus-z-stab --where`, point at the acquisition
+  # software's Z control, and read the numbers off.
+  #
+  # For software driven by a numeric Z field rather than step buttons, write the
+  # sequence that clicks the field, types the value and presses Enter. `{z}` in
+  # a `text_input` is replaced by the absolute z the program is asking for, in
+  # microns, tracked from the file's own `zPosition`.
+  z_up:
+    - {step: click, x: 1850, y: 420, delay: 0.3}
+  z_down:
+    - {step: click, x: 1850, y: 470, delay: 0.3}
+
+# ----------------------------------------------------------------- log
+log:
+  # Every frame measured, one row, written as it happens: timepoint, timestamp,
+  # measured X/Y shift, focus metric, metric relative to the reference, the
+  # decision, and the zPosition the file reported. This is the record of what
+  # the program saw and what it did; keep it with the recording.
+  csv: zstab-log.csv
+  # Print one line to the console every N frames. 0 prints only decisions.
+  print_every: 8

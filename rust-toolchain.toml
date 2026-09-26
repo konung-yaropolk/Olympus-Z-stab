@@ -1,0 +1,11 @@
+# 1.77 is the last Rust that emits binaries which run on Windows 7; support was
+# removed in 1.78. The machine beside the microscope is Windows 7, so this is
+# not a preference.
+#
+# Building with a newer toolchain is possible via the tier-3
+# `x86_64-win7-windows-msvc` target (nightly + `-Z build-std`), which is what
+# FastTIFF does — but that path is unnecessary here and needs nightly, so this
+# takes the simple one.
+[toolchain]
+channel = "1.77"
+components = ["rustfmt", "clippy"]

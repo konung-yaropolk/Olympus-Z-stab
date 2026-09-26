@@ -1,0 +1,66 @@
+# Z-plane stabiliser for Olympus/Evident FluoView acquisitions.
+#
+# Reads an .oir while the acquisition software is still writing it, measures
+# focus drift against the start of the recording, and corrects it by clicking
+# the acquisition software's own Z controls.
+#
+# # Why the dependency list is this short, and these versions
+#
+# The target is a Windows 7 machine beside the microscope. Rust dropped Windows
+# 7 support in 1.78, so this builds on **1.77** (see `rust-toolchain.toml`) and
+# every dependency has to work there. Cargo 1.77 has no MSRV-aware resolver, so
+# versions that matter are pinned exactly rather than left to float onto a
+# release that needs a newer compiler.
+#
+# `enigo` is held at 0.1.3 for the same reason it is in the autoclicker this
+# borrows its click mechanism from: 0.6 does not build for Windows 7.
+#
+# There is deliberately no OpenCV. The `opencv` crate binds a C++ library that
+# would have to be found, built and shipped as DLLs beside the exe on a machine
+# that cannot be given a modern toolchain — for the four operations this
+# actually needs (an FFT, a phase correlation, a gradient, a variance), all of
+# which are a page of code each. `rustfft` supplies the only hard part.
+[package]
+name = "olympus-z-stab"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Live Z-drift stabilisation for Olympus FluoView OIR acquisitions"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "olympus-z-stab"
+path = "src/main.rs"
+
+[dependencies]
+# The click mechanism, from the autoclicker. 0.1.3 is the last line that runs on
+# Windows 7; the API here is `mouse_move_to` / `mouse_click` / `key_sequence` /
+# `key_down` / `key_up` / `mouse_location`.
+enigo = "=0.1.3"
+serde = { version = "1.0", features = ["derive"] }
+# 0.8 rather than 0.9+: 0.9 raised the MSRV and renamed half the API, and this
+# is the version the autoclicker's config files are already written for.
+serde_yaml = "=0.8.26"
+# Phase correlation is an FFT, and this is the one Rust FFT that handles
+# non-power-of-two frames (Bluestein) — a 512x512 frame is fine either way, but
+# a cropped ROI is not a power of two in either axis. MIT OR Apache-2.0.
+rustfft = "=6.2.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# 'unwind', not 'abort': a panic in the measurement thread must not take the
+# process down while it is armed and half-way through a click sequence.
+panic = "unwind"
+
+
+[build-dependencies]
+winres = "0.1.12"
+
+[package.metadata.winres]
+OriginalFilename = "Olympus-Z-stab.exe"
+LegalCopyright = "konung_yaropolk © 2026"
+FileDescription = "Olympus Microscope auto Z-adjuster"
+ProductName = "Olympus-Z-stab"
